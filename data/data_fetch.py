@@ -16,11 +16,13 @@ def fetch_instruments():
 
 
 def normalize_expiry(expiry_str):
+    """Try multiple formats to parse expiry string into datetime."""
     for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%b-%y"):
         try:
             return pd.to_datetime(expiry_str, format=fmt)
         except Exception:
             continue
+    # fallback: let pandas try automatically
     try:
         return pd.to_datetime(expiry_str, errors="coerce")
     except Exception:
@@ -28,12 +30,17 @@ def normalize_expiry(expiry_str):
 
 
 def fetch_option_chain(obj, symbol):
+    """
+    Build option chain manually using instruments master + Quote API.
+    Auto-picks nearest upcoming expiry for given symbol (e.g., NIFTY, BANKNIFTY).
+    """
     try:
         instruments = fetch_instruments()
         if instruments.empty:
             print("⚠️ Instruments not available")
             return pd.DataFrame()
 
+        # Filter only option contracts for given symbol
         options = instruments[
             (instruments["name"].str.upper() == symbol.upper()) &
             (instruments["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
@@ -43,7 +50,10 @@ def fetch_option_chain(obj, symbol):
             print(f"⚠️ No option contracts found for {symbol}")
             return pd.DataFrame()
 
+        # Normalize expiry column
         options["expiry_parsed"] = options["expiry"].apply(normalize_expiry)
+
+        # Pick nearest valid expiry (>= today)
         expiry_dates = sorted([e for e in options["expiry_parsed"].unique() if pd.notna(e) and e >= pd.Timestamp.today()])
         if not expiry_dates:
             print(f"⚠️ No valid upcoming expiries for {symbol}")
@@ -55,12 +65,14 @@ def fetch_option_chain(obj, symbol):
         chain_data = []
         for _, row in options.iterrows():
             try:
+                # tradingsymbol / symbol fallback
                 tsymbol = (
                     row["tradingsymbol"]
                     if "tradingsymbol" in options.columns and pd.notna(row.get("tradingsymbol"))
                     else row["symbol"]
                 )
 
+                # option type fallback
                 if "optiontype" in options.columns and pd.notna(row.get("optiontype")):
                     opt_type = row["optiontype"]
                 elif "opttype" in options.columns and pd.notna(row.get("opttype")):
@@ -70,11 +82,14 @@ def fetch_option_chain(obj, symbol):
                 else:
                     opt_type = None
 
-                ltp_resp = obj.ltpData("NFO", tsymbol, row["token"])
-                if "data" in ltp_resp and ltp_resp["data"] is not None:
-                    ltp = ltp_resp["data"].get("ltp", None)
+                # ✅ Use Quote API to fetch LTP + OI safely
+                quote = obj.getQuote("NFO", tsymbol, row["token"])
+                if "data" in quote and quote["data"] is not None:
+                    ltp = quote["data"].get("ltp", None)
+                    oi = quote["data"].get("openInterest", 0)  # safe fallback
                 else:
                     ltp = None
+                    oi = 0
 
                 chain_data.append({
                     "tradingsymbol": tsymbol,
@@ -82,13 +97,15 @@ def fetch_option_chain(obj, symbol):
                     "expiry": row.get("expiry"),
                     "option_type": opt_type,
                     "ltp": ltp,
+                    "openInterest": oi,  # <-- always present now
                     "token": row.get("token")
                 })
             except Exception as e:
-                print(f"⚠️ LTP fetch failed for {row.get('symbol', 'UNKNOWN')}: {e}")
+                print(f"⚠️ LTP/OI fetch failed for {row.get('symbol', 'UNKNOWN')}: {e}")
 
         return pd.DataFrame(chain_data)
 
     except Exception as e:
         print(f"⚠️ Option chain fetch error: {e}")
         return pd.DataFrame()
+                    
